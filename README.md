@@ -51,6 +51,199 @@ When to use each command:
 - `doctor`: validates local configuration and optional provider readiness.
 - `remove`: stops and unregisters an instance safely.
 
+## What The Tool Actually Does
+
+At a practical level, the manager gives you a single control plane for deception services.
+
+- It creates honeypot instances from known templates instead of making you hand-build every decoy.
+- It generates synthetic credentials and decoy data automatically so you do not need to invent fake users, banners, or records manually.
+- It starts the honeypot either as a local Python process or as a Docker-managed container.
+- It records lifecycle state, interaction logs, and alerts in one SQLite database.
+- It helps you inspect the current fleet through CLI commands and the optional dashboard.
+- It provides a clean way to remove instances without leaving orphaned processes or containers behind.
+
+That makes it useful for defenders who want repeatable deception setups rather than ad hoc scripts.
+
+## Why This Is Helpful
+
+This tool is most helpful when you care about speed, consistency, and safe defaults.
+
+- Speed: you can go from “I need an SSH decoy” to a running instance with one command.
+- Consistency: every honeypot has a stored name, port, driver, credentials, fake data profile, and runtime metadata.
+- Visibility: all interaction events end up in one place instead of being scattered across stdout, random text files, or separate services.
+- Safer experimentation: the defaults bias toward localhost binding, internal Docker networks, fake credentials, and low-risk synthetic content.
+- Easier operations: `inspect`, `metrics`, `alerts`, and `logs` make it easier to answer “what is happening right now?” quickly.
+- Easier growth: you can start with the built-in honeypots and later integrate external ones like Conpot without throwing away the management layer.
+
+## Under The Hood
+
+When you run the tool, these pieces work together:
+
+1. The CLI in `main.py` parses the command and loads environment-backed settings.
+2. The deployer validates the request, checks the name and port, and chooses the correct template.
+3. The configurator generates fake credentials and synthetic service data for that honeypot type.
+4. The deployer launches the honeypot either as:
+   - a local Python process, or
+   - a Docker container attached to the internal honeypot network
+5. The runtime honeypot records events directly into SQLite, or an external tool writes stdout that the monitor later ingests.
+6. The logger evaluates alert rules whenever new events are recorded.
+7. The CLI or dashboard reads the SQLite store to render status, logs, metrics, and alerts.
+
+This split keeps the system simple:
+
+- deployment logic is separate from fake-data generation
+- event storage is separate from protocol handling
+- the dashboard is just another consumer of the same central event store
+
+## Module Walkthrough
+
+These are the main code paths and why they exist:
+
+| File | Responsibility |
+| --- | --- |
+| `main.py` | CLI entrypoint, command routing, rendering, and top-level wiring |
+| `manager/configurator.py` | Generates synthetic usernames, passwords, and fake service data |
+| `manager/deployer.py` | Deploys, inspects, removes, and validates honeypot instances |
+| `manager/logger.py` | Owns the SQLite schema, event storage, alerting, and metrics summaries |
+| `manager/monitor.py` | Ingests stdout-based logs from external honeypot processes |
+| `manager/templates.py` | Declares supported honeypot templates and their deployment characteristics |
+| `manager/runtime/*.py` | Built-in honeypot implementations for SSH, HTTP, and MySQL |
+| `dashboard/app.py` | Optional web UI and JSON API layer over the SQLite store |
+| `scripts/bootstrap_kali.sh` | Kali/Linux bootstrap and dependency setup |
+
+## What Happens For Each Main Command
+
+### `deploy`
+
+`deploy` is the command that does the most work.
+
+It:
+
+- resolves the requested template
+- validates the honeypot name
+- validates the port number
+- checks whether the requested port is already busy
+- generates fake credentials and fake content
+- writes the generated profile to `data/configs/`
+- starts the honeypot as a local process or Docker container
+- records the instance in SQLite so later commands can manage it
+
+### `status`
+
+`status` refreshes the runtime view of deployed honeypots.
+
+It:
+
+- syncs any external stdout logs first
+- checks whether local processes are still alive
+- checks Docker container status when Docker is used
+- returns the current status plus alert counts
+
+### `logs`
+
+`logs` is the main event retrieval surface.
+
+It:
+
+- queries SQLite for recent interaction events
+- optionally filters by honeypot, event type, source IP, or recent time window
+- returns JSON or NDJSON so it can feed shell pipelines or other tools
+
+### `alerts`
+
+`alerts` is the higher-signal view of suspicious patterns.
+
+It:
+
+- returns alert records that were generated from underlying event activity
+- helps the operator focus on repeated bad behavior instead of reading every event one by one
+
+### `inspect`
+
+`inspect` is the fastest way to understand one specific honeypot instance.
+
+It returns:
+
+- current runtime status
+- bind address and port
+- fake username and password
+- recent alerts
+- recent events
+
+### `metrics`
+
+`metrics` is the fleet summary command.
+
+It returns:
+
+- total event count
+- total alert count
+- event-type distribution
+- alert severity distribution
+- active honeypot count
+- top source IPs
+- the latest event seen in scope
+
+### `remove`
+
+`remove` cleans up the instance.
+
+It:
+
+- stops and removes the Docker container, or
+- terminates the local process
+- marks the honeypot as removed in SQLite
+
+## What Fake Data Gets Generated
+
+Each built-in honeypot gets a different decoy profile.
+
+### SSH
+
+The SSH runtime simulates:
+
+- a generated username and password
+- a fake hostname
+- a fake MOTD banner
+- a fake working directory
+- a short fake filesystem listing such as `backups`, `logs`, and `scripts`
+
+This is useful because attackers often test shell commands after login, and the decoy needs to look believable enough to hold attention briefly.
+
+### HTTP
+
+The HTTP runtime simulates:
+
+- a fake operations portal title
+- a maintenance or restricted-access banner
+- a login form
+- fake operational records in a table
+
+This is useful for collecting credential attempts, request paths, and web probing behavior.
+
+### MySQL
+
+The MySQL runtime simulates:
+
+- a fake MySQL server version string
+- a default schema name
+- a list of decoy schema names
+- fake table hints
+
+This is useful because many intruders enumerate credentials, schemas, and queries quickly once they find a database endpoint.
+
+### ICS
+
+The `ics` template does not implement a full ICS honeypot itself.
+
+Instead, it gives you a managed integration point for:
+
+- Conpot
+- another ICS honeypot binary
+- an external container image
+
+That makes the manager useful as the orchestration and logging layer even when protocol fidelity lives in another project.
+
 ## Supported Honeypots
 
 | Type | Driver | Notes |
@@ -373,6 +566,37 @@ Current built-in rules:
 - `repeated_auth_failures`: 5 failed login attempts from the same IP within 5 minutes
 - `connection_flood`: 20 connections from the same IP within 2 minutes
 
+## How Alerts Are Generated
+
+Alerts are not separate detectors running off to the side. They are derived from the same event stream the honeypots already produce.
+
+The flow is:
+
+1. a honeypot records an event such as `connection`, `login_failure`, or `command`
+2. the event is written to SQLite
+3. the logger checks whether the event pushes an IP over one of the built-in thresholds
+4. if a threshold is crossed and a recent duplicate alert does not already exist, an alert record is created
+
+This design is helpful because it keeps the system understandable:
+
+- there is one central source of truth
+- alert generation is deterministic
+- you can always trace an alert back to its underlying events
+
+## What “Properly Working” Looks Like
+
+For a healthy deployment, you should expect this sequence:
+
+1. `doctor` reports sane configuration
+2. `deploy` returns a confirmation message and a honeypot name
+3. `status` shows the honeypot as `running`
+4. the honeypot records a `startup` event
+5. traffic to the honeypot shows up in `logs`
+6. suspicious repeated traffic eventually appears in `alerts` or affects `metrics`
+7. `remove` cleanly stops the honeypot and `status` no longer lists it as active
+
+If those seven things work, the tool is doing its main job correctly.
+
 ## Common Operator Examples
 
 Deploy a local SSH decoy for password spray observation:
@@ -405,6 +629,89 @@ Pull only recent failed logins from a suspected source:
 ```bash
 python3 main.py logs --event login_failure --source-ip 203.0.113.50 --minutes 30
 ```
+
+## When To Use This Tool Vs. A Standalone Honeypot
+
+Use `deception-honeypot-manager` when you want:
+
+- one CLI to manage multiple honeypot types
+- consistent fake credential generation
+- centralized SQLite logging
+- a common dashboard and metrics layer
+- a lightweight orchestration layer around external honeypot projects
+
+Use a standalone honeypot directly when you want:
+
+- maximum protocol fidelity
+- a mature ecosystem specific to one protocol
+- deep customization in that honeypot’s own configuration model
+
+In practice, the best pattern is often:
+
+- use this manager for orchestration, consistency, and centralized visibility
+- use specialized projects like Conpot or Cowrie when you need deeper deception realism
+
+## Limitations
+
+This tool is useful, but it is intentionally pragmatic rather than perfect.
+
+- the built-in SSH, HTTP, and MySQL runtimes are lightweight decoys, not complete service emulators
+- the MySQL implementation focuses on auth and query capture, not full protocol compatibility
+- SQLite is excellent for local operation, but larger deployments may eventually want a remote database backend
+- external honeypot integrations depend on the external tool’s own behavior and log format
+- this project is designed for internal labs, research, and deception experiments rather than high-scale internet-facing production fleets
+
+## Troubleshooting
+
+### `deploy` says the port is unavailable
+
+That means another process is already listening on the requested bind address and port.
+
+Try:
+
+- choosing another port
+- checking `ss -ltnp` or `netstat -ltnp` on Linux
+- making sure an old honeypot instance is not still running
+
+### local honeypot process exits immediately
+
+The deployer now reports this explicitly and points you to the process log file.
+
+Check:
+
+- the runtime command
+- whether dependencies are installed
+- whether the chosen port is privileged or already bound
+- the latest lines in `data/process_logs/<name>.log`
+
+### Docker deployment fails on Kali
+
+Usually this is one of:
+
+- Docker is not installed
+- the Docker service is not started
+- your user is not yet in the `docker` group
+
+The included bootstrap script addresses those, but you may still need to log out and back in after group membership changes.
+
+### `logs` is empty
+
+Check:
+
+- whether the honeypot is actually running
+- whether any client traffic reached the honeypot
+- whether you filtered too aggressively with `--event`, `--source-ip`, or `--minutes`
+- whether an external honeypot is writing stdout in a format the monitor can ingest
+
+### dashboard loads but looks empty
+
+That usually means the manager is healthy but there are no active honeypots or no recent events yet.
+
+Try:
+
+- deploying one honeypot
+- generating test traffic with `curl`, `ssh`, or a MySQL client
+- refreshing the dashboard after a few seconds
 
 ## HIBP Integration Notes
 
