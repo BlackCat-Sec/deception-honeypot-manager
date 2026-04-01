@@ -1,6 +1,9 @@
 name: Kali Smoke Test
 
 on:
+  push:
+    branches:
+      - codex/kali-smoke-test
   workflow_dispatch:
 
 jobs:
