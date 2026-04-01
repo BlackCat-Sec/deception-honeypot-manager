@@ -4,8 +4,10 @@ import json
 import os
 import shlex
 import signal
+import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -70,7 +72,11 @@ class HoneypotDeployer:
         template = get_template(kind)
         resolved_port = port or template.default_port
         resolved_name = name or self._generate_name(template.kind)
+        self._validate_name(resolved_name)
+        self._validate_port(resolved_port)
         self._validate_driver(template, driver)
+        self._ensure_name_available(resolved_name)
+        self._ensure_port_available(bind_address, resolved_port)
         profile = self.configurator.build_profile(
             name=resolved_name,
             template=template,
@@ -211,6 +217,9 @@ class HoneypotDeployer:
                 creationflags=self._creation_flags(),
                 start_new_session=os.name != "nt",
             )
+        startup_error = self._wait_for_process_startup(process, log_path)
+        if startup_error:
+            raise RuntimeError(startup_error)
         return {
             "name": profile.name,
             "kind": profile.kind,
@@ -247,6 +256,15 @@ class HoneypotDeployer:
         )
         return env
 
+    def inspect(self, name: str) -> dict[str, Any]:
+        record = self.store.get_honeypot(name)
+        if not record:
+            raise ValueError(f"Honeypot '{name}' does not exist.")
+        refreshed = self._refresh_status(record) if record.get("removed_at") is None else record
+        refreshed["recent_events"] = self.store.list_events(limit=10, honeypot_name=name)
+        refreshed["recent_alerts"] = self.store.list_alerts(limit=5, honeypot_name=name)
+        return refreshed
+
     def _validate_driver(self, template: HoneypotTemplate, driver: str) -> None:
         if driver not in {"docker", "local"}:
             raise ValueError("Driver must be 'docker' or 'local'.")
@@ -254,6 +272,52 @@ class HoneypotDeployer:
             raise ValueError(f"Template '{template.kind}' does not support docker deployments.")
         if driver == "local" and not template.local_supported:
             raise ValueError(f"Template '{template.kind}' does not support local deployments.")
+
+    def _validate_name(self, name: str) -> None:
+        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+        if not name or any(character not in allowed for character in name):
+            raise ValueError(
+                "Honeypot name must contain only letters, numbers, hyphens, and underscores."
+            )
+
+    def _validate_port(self, port: int) -> None:
+        if not 1 <= port <= 65535:
+            raise ValueError("Port must be between 1 and 65535.")
+
+    def _ensure_name_available(self, name: str) -> None:
+        existing = self.store.get_honeypot(name)
+        if existing and existing.get("removed_at") is None:
+            raise ValueError(f"Honeypot '{name}' already exists.")
+
+    def _ensure_port_available(self, bind_address: str, port: int) -> None:
+        test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        test_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        target = "127.0.0.1" if bind_address == "localhost" else bind_address
+        try:
+            test_socket.bind((target, port))
+        except OSError as exc:
+            raise RuntimeError(
+                f"Port {port} on {bind_address} is unavailable: {exc}"
+            ) from exc
+        finally:
+            test_socket.close()
+
+    def _wait_for_process_startup(self, process: subprocess.Popen, log_path: Path) -> str | None:
+        time.sleep(0.35)
+        return_code = process.poll()
+        if return_code is None:
+            return None
+        log_excerpt = ""
+        if log_path.exists():
+            content = log_path.read_text(encoding="utf-8", errors="replace")
+            log_excerpt = "\n".join(content.strip().splitlines()[-10:])
+        message = (
+            f"Local honeypot process exited immediately with code {return_code}. "
+            f"See {log_path} for details."
+        )
+        if log_excerpt:
+            message += f"\nRecent log output:\n{log_excerpt}"
+        return message
 
     def _generate_name(self, kind: str) -> str:
         prefix = f"{kind}_honeypot_"

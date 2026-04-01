@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import socket
 import tempfile
 import unittest
 from pathlib import Path
@@ -122,7 +123,22 @@ class HoneypotDeployerTests(unittest.TestCase):
         self.assertTrue(self.docker.containers.container.stopped)
         self.assertTrue(self.docker.containers.container.removed)
 
+    def test_deploy_rejects_duplicate_active_name(self) -> None:
+        self.deployer.deploy(kind="ssh", port=2222, driver="docker", name="trap_a")
+
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            self.deployer.deploy(kind="http", port=8080, driver="docker", name="trap_a")
+
+    def test_deploy_rejects_busy_port(self) -> None:
+        busy_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        busy_socket.bind(("127.0.0.1", 0))
+        busy_socket.listen(1)
+        busy_port = busy_socket.getsockname()[1]
+        self.addCleanup(busy_socket.close)
+
+        with self.assertRaisesRegex(RuntimeError, "unavailable"):
+            self.deployer.deploy(kind="ssh", port=busy_port, driver="docker")
+
 
 if __name__ == "__main__":
     unittest.main()
-

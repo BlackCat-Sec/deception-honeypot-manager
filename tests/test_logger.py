@@ -42,7 +42,34 @@ class EventStoreTests(unittest.TestCase):
         self.assertEqual(len(alerts), 1)
         self.assertEqual(alerts[0]["rule"], "repeated_auth_failures")
 
+    def test_metrics_summary_returns_breakdowns_and_top_sources(self) -> None:
+        for _ in range(3):
+            self.store.log_event(
+                honeypot_name="ssh_honeypot_1",
+                event_type="connection",
+                source_ip="203.0.113.10",
+                details="Connected",
+            )
+        self.store.log_event(
+            honeypot_name="ssh_honeypot_1",
+            event_type="command",
+            source_ip="203.0.113.10",
+            details="uname -a",
+        )
+        self.store.log_event(
+            honeypot_name="ssh_honeypot_1",
+            event_type="connection",
+            source_ip="203.0.113.11",
+            details="Connected",
+        )
+
+        summary = self.store.summarize_metrics(honeypot_name="ssh_honeypot_1")
+
+        self.assertEqual(summary["total_events"], 5)
+        self.assertEqual(summary["event_type_breakdown"]["connection"], 4)
+        self.assertEqual(summary["top_source_ips"][0]["source_ip"], "203.0.113.10")
+        self.assertEqual(summary["latest_event"]["honeypot"], "ssh_honeypot_1")
+
 
 if __name__ == "__main__":
     unittest.main()
-

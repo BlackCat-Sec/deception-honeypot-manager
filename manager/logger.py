@@ -13,6 +13,12 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def event_where_with_source(base_where: str) -> str:
+    if not base_where:
+        return "WHERE source_ip IS NOT NULL AND source_ip != ''"
+    return f"{base_where} AND source_ip IS NOT NULL AND source_ip != ''"
+
+
 @dataclass(frozen=True)
 class AlertThresholds:
     repeated_failures: int = 5
@@ -239,12 +245,33 @@ class EventStore:
             timestamp=event_timestamp,
         )
 
-    def list_events(self, limit: int = 10, honeypot_name: str | None = None) -> list[dict[str, Any]]:
-        query = "SELECT * FROM events"
+    def list_events(
+        self,
+        limit: int = 10,
+        honeypot_name: str | None = None,
+        *,
+        event_type: str | None = None,
+        source_ip: str | None = None,
+        since_minutes: int | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
         params: list[Any] = []
         if honeypot_name:
-            query += " WHERE honeypot_name = ?"
+            clauses.append("honeypot_name = ?")
             params.append(honeypot_name)
+        if event_type:
+            clauses.append("event_type = ?")
+            params.append(event_type)
+        if source_ip:
+            clauses.append("source_ip = ?")
+            params.append(source_ip)
+        if since_minutes is not None:
+            clauses.append("timestamp >= ?")
+            params.append(self._minutes_ago(since_minutes))
+
+        query = "SELECT * FROM events"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY timestamp DESC LIMIT ?"
         params.append(limit)
         with self._session() as connection:
@@ -270,6 +297,114 @@ class EventStore:
                 (honeypot_name,),
             ).fetchone()
         return int(row["count"]) if row else 0
+
+    def summarize_metrics(
+        self,
+        *,
+        honeypot_name: str | None = None,
+        since_minutes: int | None = None,
+        top_limit: int = 5,
+    ) -> dict[str, Any]:
+        event_where, event_params = self._build_event_filters(
+            honeypot_name=honeypot_name,
+            since_minutes=since_minutes,
+        )
+        alert_where, alert_params = self._build_alert_filters(
+            honeypot_name=honeypot_name,
+            since_minutes=since_minutes,
+        )
+
+        with self._session() as connection:
+            total_events = int(
+                connection.execute(
+                    f"SELECT COUNT(*) AS count FROM events {event_where}",
+                    tuple(event_params),
+                ).fetchone()["count"]
+            )
+            total_alerts = int(
+                connection.execute(
+                    f"SELECT COUNT(*) AS count FROM alerts {alert_where}",
+                    tuple(alert_params),
+                ).fetchone()["count"]
+            )
+            latest_event_row = connection.execute(
+                f"SELECT * FROM events {event_where} ORDER BY timestamp DESC LIMIT 1",
+                tuple(event_params),
+            ).fetchone()
+            top_sources_rows = connection.execute(
+                f"""
+                SELECT source_ip, COUNT(*) AS count
+                FROM events
+                {event_where_with_source(event_where)}
+                GROUP BY source_ip
+                ORDER BY count DESC, source_ip ASC
+                LIMIT ?
+                """,
+                tuple(event_params + [top_limit]),
+            ).fetchall()
+            event_type_rows = connection.execute(
+                f"""
+                SELECT event_type, COUNT(*) AS count
+                FROM events
+                {event_where}
+                GROUP BY event_type
+                ORDER BY count DESC, event_type ASC
+                """,
+                tuple(event_params),
+            ).fetchall()
+            severity_rows = connection.execute(
+                f"""
+                SELECT severity, COUNT(*) AS count
+                FROM alerts
+                {alert_where}
+                GROUP BY severity
+                ORDER BY count DESC, severity ASC
+                """,
+                tuple(alert_params),
+            ).fetchall()
+            honeypot_query = """
+                SELECT status, COUNT(*) AS count
+                FROM honeypots
+                WHERE removed_at IS NULL
+            """
+            honeypot_params: list[Any] = []
+            if honeypot_name:
+                honeypot_query += " AND name = ?"
+                honeypot_params.append(honeypot_name)
+            honeypot_query += """
+                GROUP BY status
+                ORDER BY count DESC, status ASC
+            """
+            honeypot_rows = connection.execute(
+                honeypot_query,
+                tuple(honeypot_params),
+            ).fetchall()
+
+        active_honeypots = self.list_honeypots()
+        if honeypot_name:
+            active_honeypots = [item for item in active_honeypots if item["name"] == honeypot_name]
+
+        return {
+            "scope": {
+                "honeypot": honeypot_name,
+                "since_minutes": since_minutes,
+            },
+            "active_honeypots": len(active_honeypots),
+            "total_events": total_events,
+            "total_alerts": total_alerts,
+            "status_breakdown": {row["status"]: int(row["count"]) for row in honeypot_rows},
+            "event_type_breakdown": {
+                row["event_type"]: int(row["count"]) for row in event_type_rows
+            },
+            "alert_severity_breakdown": {
+                row["severity"]: int(row["count"]) for row in severity_rows
+            },
+            "top_source_ips": [
+                {"source_ip": row["source_ip"], "count": int(row["count"])}
+                for row in top_sources_rows
+            ],
+            "latest_event": self._decode_event(latest_event_row) if latest_event_row else None,
+        }
 
     def _evaluate_alerts(
         self,
@@ -377,6 +512,45 @@ class EventStore:
         parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
         shifted = parsed + timedelta(minutes=minutes)
         return shifted.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _minutes_ago(self, minutes: int) -> str:
+        now = datetime.now(timezone.utc)
+        shifted = now - timedelta(minutes=minutes)
+        return shifted.isoformat().replace("+00:00", "Z")
+
+    def _build_event_filters(
+        self,
+        *,
+        honeypot_name: str | None,
+        since_minutes: int | None,
+    ) -> tuple[str, list[Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if honeypot_name:
+            clauses.append("honeypot_name = ?")
+            params.append(honeypot_name)
+        if since_minutes is not None:
+            clauses.append("timestamp >= ?")
+            params.append(self._minutes_ago(since_minutes))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return where, params
+
+    def _build_alert_filters(
+        self,
+        *,
+        honeypot_name: str | None,
+        since_minutes: int | None,
+    ) -> tuple[str, list[Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if honeypot_name:
+            clauses.append("honeypot_name = ?")
+            params.append(honeypot_name)
+        if since_minutes is not None:
+            clauses.append("triggered_at >= ?")
+            params.append(self._minutes_ago(since_minutes))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return where, params
 
     @contextmanager
     def _session(self):

@@ -45,6 +45,9 @@ When to use each command:
 - `status`: checks whether deployed instances are still running.
 - `logs`: returns recent interaction events as JSON for quick triage or pipeline ingestion.
 - `alerts`: summarizes suspicious patterns such as repeated authentication failures.
+- `templates`: shows what honeypots are available and how they are intended to be used.
+- `inspect`: shows fake credentials, fake data context, and recent activity for one instance.
+- `metrics`: summarizes events, alerts, and top source IPs for one honeypot or the full fleet.
 - `doctor`: validates local configuration and optional provider readiness.
 - `remove`: stops and unregisters an instance safely.
 
@@ -194,6 +197,13 @@ Choose deployment mode based on how realistic you need the decoy to be:
 - `--command`: best when integrating an existing honeypot binary or Python project that already emits useful stdout logs.
 - `--image`: best when you already have a ready-made honeypot container image, such as Conpot.
 
+The deploy path now includes guardrails:
+
+- validates honeypot names early
+- rejects invalid port numbers
+- checks whether the requested host port is already busy
+- detects local service processes that crash immediately and points you to their log file
+
 ## CLI Usage
 
 ### Deploy an SSH honeypot
@@ -226,6 +236,13 @@ python3 main.py deploy ics --port 502 --command "conpot --template default"
 python3 main.py status
 ```
 
+### See supported templates
+
+```bash
+python3 main.py templates
+python3 main.py templates --json
+```
+
 ### View logs
 
 ```bash
@@ -256,6 +273,21 @@ Example JSON:
 python3 main.py alerts
 ```
 
+### Inspect one honeypot deeply
+
+```bash
+python3 main.py inspect ssh_honeypot_1
+python3 main.py inspect ssh_honeypot_1 --json
+```
+
+### Summarize metrics
+
+```bash
+python3 main.py metrics
+python3 main.py metrics ssh_honeypot_1 --minutes 60
+python3 main.py metrics --json
+```
+
 ### Inspect configuration readiness
 
 ```bash
@@ -284,6 +316,7 @@ The dashboard exposes:
 - `/api/status` for current honeypot status
 - `/api/logs` for recent logs
 - `/api/alerts` for recent alerts
+- `/api/metrics` for fleet or per-honeypot summaries
 - `/healthz` for service health and provider readiness
 
 ## External Honeypot Integrations
@@ -365,6 +398,12 @@ Pull the latest activity for pipeline consumption:
 
 ```bash
 python3 main.py logs --limit 50 > latest-events.json
+```
+
+Pull only recent failed logins from a suspected source:
+
+```bash
+python3 main.py logs --event login_failure --source-ip 203.0.113.50 --minutes 30
 ```
 
 ## HIBP Integration Notes

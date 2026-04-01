@@ -9,7 +9,7 @@ from manager.deployer import HoneypotDeployer
 from manager.logger import EventStore
 from manager.monitor import ExternalEventMonitor
 from manager.settings import ManagerSettings
-from manager.templates import supported_honeypots
+from manager.templates import TEMPLATES, supported_honeypots
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -59,6 +59,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Alias for --limit to support inputs like 'logs --last 50'.",
     )
     logs_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
+    logs_parser.add_argument("--event", dest="event_type", help="Filter by event type.")
+    logs_parser.add_argument("--source-ip", help="Filter by source IP.")
+    logs_parser.add_argument("--minutes", type=int, help="Only include events from the last N minutes.")
+    logs_parser.add_argument(
+        "--format",
+        choices=("json", "ndjson"),
+        default="json",
+        help="Output format for log results.",
+    )
 
     alerts_parser = subparsers.add_parser("alerts", help="Show recent alerts.")
     alerts_parser.add_argument("name", nargs="?", help="Optional honeypot name filter.")
@@ -74,6 +83,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show configuration and optional provider readiness checks.",
     )
     doctor_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
+
+    templates_parser = subparsers.add_parser(
+        "templates",
+        help="List supported honeypot templates and deployment notes.",
+    )
+    templates_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
+
+    inspect_parser = subparsers.add_parser(
+        "inspect",
+        help="Show detailed metadata, fake credentials, and recent activity for a honeypot.",
+    )
+    inspect_parser.add_argument("name")
+    inspect_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
+
+    metrics_parser = subparsers.add_parser(
+        "metrics",
+        help="Summarize events, alerts, and top source IPs.",
+    )
+    metrics_parser.add_argument("name", nargs="?", help="Optional honeypot name filter.")
+    metrics_parser.add_argument("--minutes", type=int, help="Only include the last N minutes.")
+    metrics_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
 
     return parser
 
@@ -92,7 +122,7 @@ def main() -> int:
     monitor = ExternalEventMonitor(store)
     deployer = HoneypotDeployer(root_dir=root_dir, store=store)
 
-    if args.command in {"status", "logs", "alerts"}:
+    if args.command in {"status", "logs", "alerts", "inspect", "metrics"}:
         monitor.sync(getattr(args, "name", None))
 
     if args.command == "deploy":
@@ -128,8 +158,18 @@ def main() -> int:
 
     if args.command == "logs":
         limit = args.limit_alias or args.limit
-        events = store.list_events(limit=limit, honeypot_name=args.name)
-        print(json.dumps(events, indent=2))
+        events = store.list_events(
+            limit=limit,
+            honeypot_name=args.name,
+            event_type=args.event_type,
+            source_ip=args.source_ip,
+            since_minutes=args.minutes,
+        )
+        if args.format == "ndjson":
+            for event in events:
+                print(json.dumps(event))
+        else:
+            print(json.dumps(events, indent=2))
         return 0
 
     if args.command == "alerts":
@@ -153,7 +193,7 @@ def main() -> int:
 
     if args.command == "doctor":
         payload = {
-            "db_path": str(settings.db_path),
+            "db_path": str(db_path),
             "default_bind": settings.default_bind,
             "dashboard_host": settings.dashboard_host,
             "dashboard_port": settings.dashboard_port,
@@ -163,6 +203,44 @@ def main() -> int:
             print(json.dumps(payload, indent=2))
         else:
             print(render_doctor(payload))
+        return 0
+
+    if args.command == "templates":
+        payload = [
+            {
+                "kind": template.kind,
+                "description": template.description,
+                "default_port": template.default_port,
+                "docker_supported": template.docker_supported,
+                "local_supported": template.local_supported,
+                "runtime_module": template.runtime_module,
+                "external_examples": list(template.external_examples),
+            }
+            for template in TEMPLATES.values()
+        ]
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(render_templates(payload))
+        return 0
+
+    if args.command == "inspect":
+        payload = deployer.inspect(args.name)
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(render_inspect(payload))
+        return 0
+
+    if args.command == "metrics":
+        payload = store.summarize_metrics(
+            honeypot_name=args.name,
+            since_minutes=args.minutes,
+        )
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(render_metrics(payload))
         return 0
 
     parser.error("Unknown command.")
@@ -211,6 +289,62 @@ def render_doctor(payload: dict[str, Any]) -> str:
             f"  - {provider['name']}: "
             f"{'ready' if provider['enabled'] else 'disabled'} "
             f"({provider['reason']})"
+        )
+    return "\n".join(lines)
+
+
+def render_templates(templates: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for template in sorted(templates, key=lambda item: item["kind"]):
+        drivers = []
+        if template["local_supported"]:
+            drivers.append("local")
+        if template["docker_supported"]:
+            drivers.append("docker")
+        lines.append(
+            f"{template['kind']} ({', '.join(drivers)}) on default port {template['default_port']}"
+        )
+        lines.append(f"  {template['description']}")
+        if template["external_examples"]:
+            lines.append(f"  examples: {', '.join(template['external_examples'])}")
+    return "\n".join(lines)
+
+
+def render_inspect(payload: dict[str, Any]) -> str:
+    lines = [
+        f"Name: {payload['name']}",
+        f"Type: {payload['kind']}",
+        f"Driver: {payload['driver']}",
+        f"Bind: {payload['bind_address']}:{payload['port']}",
+        f"Status: {payload['status']}",
+        "Fake credentials:",
+        f"  username: {payload['credentials'].get('username', '-')}",
+        f"  password: {payload['credentials'].get('password', '-')}",
+        f"Recent alerts: {len(payload.get('recent_alerts', []))}",
+        f"Recent events: {len(payload.get('recent_events', []))}",
+    ]
+    return "\n".join(lines)
+
+
+def render_metrics(payload: dict[str, Any]) -> str:
+    lines = [
+        f"Scope honeypot: {payload['scope']['honeypot'] or 'all'}",
+        f"Scope window: {payload['scope']['since_minutes'] or 'all time'}",
+        f"Active honeypots: {payload['active_honeypots']}",
+        f"Total events: {payload['total_events']}",
+        f"Total alerts: {payload['total_alerts']}",
+        f"Event types: {json.dumps(payload['event_type_breakdown'])}",
+        f"Alert severities: {json.dumps(payload['alert_severity_breakdown'])}",
+    ]
+    if payload["top_source_ips"]:
+        top_sources = ", ".join(
+            f"{item['source_ip']} ({item['count']})" for item in payload["top_source_ips"]
+        )
+        lines.append(f"Top source IPs: {top_sources}")
+    if payload["latest_event"]:
+        latest = payload["latest_event"]
+        lines.append(
+            f"Latest event: {latest['timestamp']} {latest['honeypot']} {latest['event']}"
         )
     return "\n".join(lines)
 

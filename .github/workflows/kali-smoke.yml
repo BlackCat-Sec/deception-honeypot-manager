@@ -1,0 +1,72 @@
+name: Kali Smoke Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  kali-smoke:
+    runs-on: ubuntu-latest
+    container:
+      image: kalilinux/kali-rolling
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Install Git
+        run: |
+          apt-get update
+          apt-get install -y git
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Kali dependencies
+        run: |
+          apt-get update
+          apt-get install -y python3 python3-venv python3-pip curl
+
+      - name: Create virtual environment
+        run: |
+          python3 -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: |
+          source .venv/bin/activate
+          python -m unittest discover -s tests -v
+
+      - name: Run CLI smoke test
+        run: |
+          source .venv/bin/activate
+          python main.py doctor --json
+          python main.py templates
+          python main.py deploy http --port 8099
+          sleep 2
+          curl -sS http://127.0.0.1:8099/ > /tmp/http-home.html
+          curl -sS -X POST http://127.0.0.1:8099/login \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            --data 'username=tester&password=wrongpass' > /tmp/http-login.html
+          python main.py status
+          python main.py inspect http_honeypot_1 --json > /tmp/inspect.json
+          python main.py logs http_honeypot_1 --limit 20 --json > /tmp/logs.json
+          python main.py metrics http_honeypot_1 --json > /tmp/metrics.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          logs = json.loads(Path("/tmp/logs.json").read_text(encoding="utf-8"))
+          metrics = json.loads(Path("/tmp/metrics.json").read_text(encoding="utf-8"))
+
+          event_types = {entry["event"] for entry in logs}
+          assert "startup" in event_types, f"missing startup event: {event_types}"
+          assert "http_request" in event_types, f"missing http_request event: {event_types}"
+          assert "login_failure" in event_types, f"missing login_failure event: {event_types}"
+          assert metrics["total_events"] >= 3, metrics
+          assert metrics["active_honeypots"] == 1, metrics
+          PY
+          python main.py remove http_honeypot_1
+          python main.py status
